@@ -10,4 +10,4 @@ bin           = @["nimper_proxy"]
 # Dependencies
 
 requires "nim >= 2.0.0"
-requires "https://github.com/upi-0/nimper"
+requires "https://github.com/upi-0/nimper >= 0.2.0"
