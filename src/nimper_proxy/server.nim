@@ -2,9 +2,17 @@
 #          nimper-proxy — Multi-threaded HTTP & HTTPS (MITM CONNECT) Forward Proxy Server
 #
 
-import std/[net, nativesockets, strutils, httpcore, locks, json]
+import std/[net, nativesockets, strutils, httpcore, locks, json, os]
+when defined(windows):
+  import std/winlean
+else:
+  import std/posix
 import nimper
 import ./[config, certs]
+
+const
+  MaxSocketQueueCapacity = 4096
+  StreamBufferSize = 65536
 
 type
   ParsedHttpRequest* = object
@@ -15,9 +23,20 @@ type
     body*: string
     keepAlive*: bool
 
-  ClientWorkerArgs = object
-    clientFd: SocketHandle
+  SocketQueue = object
+    lock: Lock
+    notEmpty: Cond
+    notFull: Cond
+    buf: array[MaxSocketQueueCapacity, SocketHandle]
+    head: int
+    tail: int
+    count: int
+
+  WorkerThreadArgs = object
+    workerId: int
     cfg: ProxyConfig
+    queue: ptr SocketQueue
+    shareHandle: PSH
 
 var logLock: Lock
 initLock(logLock)
@@ -33,7 +52,7 @@ proc logError*(msg: string) =
   defer: release(logLock)
   stderr.writeLine("[nimper-proxy ERROR] " & msg)
 
-proc httpStatusReason(code: int): string =
+proc httpStatusReason*(code: int): string =
   case code
   of 100: "Continue"
   of 101: "Switching Protocols"
@@ -55,7 +74,12 @@ proc httpStatusReason(code: int): string =
   of 405: "Method Not Allowed"
   of 407: "Proxy Authentication Required"
   of 408: "Request Timeout"
+  of 412: "Precondition Failed"
   of 413: "Payload Too Large"
+  of 414: "URI Too Long"
+  of 415: "Unsupported Media Type"
+  of 416: "Range Not Satisfiable"
+  of 422: "Unprocessable Entity"
   of 429: "Too Many Requests"
   of 500: "Internal Server Error"
   of 502: "Bad Gateway"
@@ -63,16 +87,114 @@ proc httpStatusReason(code: int): string =
   of 504: "Gateway Timeout"
   else: "OK"
 
+proc toHexLower(n: int): string =
+  const digits = "0123456789abcdef"
+  if n <= 0:
+    return "0"
+  var val = n
+  var tmp = ""
+  while val > 0:
+    tmp.add(digits[val and 0xF])
+    val = val shr 4
+  result = newString(tmp.len)
+  for i in 0 ..< tmp.len:
+    result[i] = tmp[tmp.len - 1 - i]
+
+proc isClientDisconnected*(sock: net.Socket): bool =
+  ## Non-blocking check whether the downstream client closed or reset the TCP connection.
+  ## Uses `selectRead(0)` + `recv(..., MSG_PEEK)` so pipelined requests are never consumed.
+  let fd = sock.getFd()
+  if fd == osInvalidSocket:
+    return true
+  var readFds = @[fd]
+  try:
+    if selectRead(readFds, 0) > 0:
+      var dummy: char = '\0'
+      when defined(windows):
+        let n = winlean.recv(fd, addr dummy, 1, MSG_PEEK)
+        if n == 0:
+          return true
+        elif n < 0:
+          let err = osLastError().int32
+          if err != WSAEWOULDBLOCK and err != WSAEINTR:
+            return true
+      else:
+        let n = posix.recv(fd, addr dummy, 1, posix.MSG_PEEK)
+        if n == 0:
+          return true
+        elif n < 0:
+          let err = osLastError().int32
+          if err != EWOULDBLOCK and err != EAGAIN and err != EINTR:
+            return true
+  except CatchableError:
+    return true
+  return false
+
+proc sendAll*(sock: net.Socket, data: pointer, totalLen: int): bool =
+  ## Writes `totalLen` raw bytes from `data` to `sock` without heap copies or busy-spinning.
+  ## Returns `false` immediately if the client disconnects.
+  if totalLen <= 0:
+    return true
+  let fd = sock.getFd()
+  if fd == osInvalidSocket:
+    return false
+  let baseAddr = cast[uint](data)
+  var written = 0
+  var waitSlices = 0
+  const maxWaitSlices = 240 # 240 * 250ms = 60s max downstream ZeroWindow backpressure stall
+
+  while written < totalLen:
+    let chunkPtr = cast[pointer](baseAddr + uint(written))
+    let remaining = totalLen - written
+    var sent = 0
+    try:
+      sent = sock.send(chunkPtr, remaining)
+    except CatchableError:
+      return false
+
+    if sent > 0:
+      written += sent
+      waitSlices = 0
+    elif sent == 0:
+      return false
+    else:
+      let err = osLastError().int32
+      when defined(windows):
+        let isWouldBlock = (err == WSAEWOULDBLOCK or err == WSAEINTR)
+      else:
+        let isWouldBlock = (err == EWOULDBLOCK or err == EAGAIN or err == EINTR)
+      if not isWouldBlock:
+        return false
+      if isClientDisconnected(sock):
+        return false
+      inc(waitSlices)
+      if waitSlices > maxWaitSlices:
+        return false
+      var writeFds = @[fd]
+      try:
+        discard selectWrite(writeFds, 250)
+      except CatchableError:
+        return false
+      if isClientDisconnected(sock):
+        return false
+  return true
+
+proc sendString(sock: net.Socket, s: string): bool {.inline.} =
+  if s.len == 0:
+    return true
+  sendAll(sock, unsafeAddr s[0], s.len)
+
 proc readExact(sock: net.Socket, length: int): string =
-  result = newStringOfCap(length)
-  var remaining = length
-  while remaining > 0:
-    let chunkSize = min(remaining, 16384)
-    let chunk = sock.recv(chunkSize)
-    if chunk.len == 0:
+  if length <= 0:
+    return ""
+  result = newString(length)
+  var totalRead = 0
+  while totalRead < length:
+    let got = sock.recv(addr result[totalRead], length - totalRead)
+    if got <= 0:
+      result.setLen(totalRead)
       break
-    result.add(chunk)
-    remaining -= chunk.len
+    totalRead += got
 
 proc readChunkedBody(sock: net.Socket): string =
   result = ""
@@ -104,7 +226,7 @@ proc readChunkedBody(sock: net.Socket): string =
     discard sock.recvLine()
 
 proc readHttpRequest*(sock: net.Socket, parsed: var ParsedHttpRequest): bool =
-  ## Reads a single HTTP/1.x request from `sock`. Returns false on EOF or closed socket.
+  ## Reads a single HTTP/1.x request from buffered `sock`. Returns false on EOF or closed socket.
   var reqLine = ""
   try:
     reqLine = sock.recvLine()
@@ -167,10 +289,7 @@ proc sendErrorResponse(sock: net.Socket, statusCode: int, message: string) =
              "Content-Type: application/json; charset=utf-8\r\n" &
              "Content-Length: " & $body.len & "\r\n" &
              "Connection: close\r\n\r\n" & body
-  try:
-    sock.send(resp)
-  except CatchableError:
-    discard
+  discard sendString(sock, resp)
 
 proc findHostHeader(headers: openArray[(string, string)]): string =
   for (k, v) in headers:
@@ -214,17 +333,23 @@ proc forwardViaNimper*(
   targetUrl: string,
   baseCfg: ProxyConfig,
   connectOverrides: RequestOverrides = RequestOverrides(),
-  keepAlive: bool = false
-) =
-  ## Executes `httpReq` against `targetUrl` using `nimper` and writes the HTTP/1.1 response back to `sock`.
+  keepAlive: bool = false,
+  session: ImpersonateSession = nil,
+  shareHandle: PSH = nil
+): bool =
+  ## Streams `httpReq` against `targetUrl` using `nimper` directly to `sock` without buffering
+  ## the full response body in memory. Returns `true` if the client connection can be kept alive.
   let mergedOverrides = extractOverridesFromHeaders(httpReq.headers, connectOverrides)
   let resolved = resolveRequestConfig(baseCfg, mergedOverrides)
   let forwardHeaders = filterUpstreamHeaders(httpReq.headers, resolved)
+  let isRange = hasRangeHeader(httpReq.headers)
+  let stallSec = max(10, resolved.timeoutMs div 1000)
 
   logInfo(
     baseCfg.verbose,
     httpReq.httpMethod & " " & targetUrl &
     " [target=" & resolved.target &
+    ", range=" & $isRange &
     ", defaultHeaders=" & $resolved.defaultHeaders &
     ", followRedirects=" & $resolved.followRedirects & "]"
   )
@@ -236,57 +361,139 @@ proc forwardViaNimper*(
     defaultHeaders = resolved.defaultHeaders,
     headers = forwardHeaders,
     body = httpReq.body,
-    timeoutMs = resolved.timeoutMs,
+    timeoutMs = 0, # Use stall detection (lowSpeedLimit/lowSpeedTimeSec) instead of hard total duration timeout
     connectTimeoutMs = resolved.connectTimeoutMs,
+    lowSpeedLimit = 1,
+    lowSpeedTimeSec = stallSec,
+    bufferSize = StreamBufferSize,
+    httpContentDecoding = not isRange,
     followRedirects = resolved.followRedirects,
     safeRedirects = resolved.safeRedirects,
     maxRedirects = resolved.maxRedirects,
     verifySsl = resolved.verifySsl,
     proxy = resolved.upstreamProxy,
-    httpVersion = resolved.httpVersion
+    httpVersion = resolved.httpVersion,
+    share = shareHandle
   )
+  if isRange:
+    nimperReq.acceptEncoding = "identity"
+
+  var headersSentToClient = false
+  var useChunkedFraming = false
+  var noBodyResponse = false
+
+  let onHeadersCb = proc(head: StreamResponseHead): bool {.gcsafe.} =
+    if isClientDisconnected(sock):
+      return false
+
+    let statusCode = if head.statusCode > 0: head.statusCode else: 200
+    let reason = httpStatusReason(statusCode)
+    noBodyResponse =
+      (httpReq.httpMethod == "HEAD") or
+      (statusCode in [101, 204, 304]) or
+      (statusCode >= 100 and statusCode < 200)
+
+    var upstreamContentLen = ""
+    var upstreamContentEnc = ""
+    if head.headers != nil:
+      for k, v in head.headers.pairs:
+        let kl = k.toLowerAscii()
+        if kl == "content-length" and upstreamContentLen.len == 0:
+          upstreamContentLen = v.strip()
+        elif kl == "content-encoding" and upstreamContentEnc.len == 0:
+          upstreamContentEnc = v.strip()
+
+    let isDecodedOnTheFly =
+      nimperReq.httpContentDecoding and
+      upstreamContentEnc.len > 0 and
+      cmpIgnoreCase(upstreamContentEnc, "identity") != 0
+
+    if noBodyResponse:
+      useChunkedFraming = false
+    elif upstreamContentLen.len > 0 and not isDecodedOnTheFly:
+      useChunkedFraming = false
+    else:
+      useChunkedFraming = true
+
+    var headerBuf = newStringOfCap(512)
+    headerBuf.add("HTTP/1.1 " & $statusCode & " " & reason & "\r\n")
+
+    if head.headers != nil:
+      for k, v in head.headers.pairs:
+        let kl = k.toLowerAscii()
+        if kl in ["transfer-encoding", "content-length", "connection", "proxy-connection", "keep-alive"]:
+          continue
+        if kl == "content-encoding" and nimperReq.httpContentDecoding:
+          continue
+        headerBuf.add(k & ": " & v & "\r\n")
+
+    headerBuf.add("X-Nimper-Target: " & resolved.target & "\r\n")
+    if head.url.len > 0:
+      headerBuf.add("X-Nimper-Effective-Url: " & head.url & "\r\n")
+    headerBuf.add("X-Nimper-Upstream-Protocol: " & upstreamHttpVersionString(head.httpVersion) & "\r\n")
+    if head.redirectCount > 0:
+      headerBuf.add("X-Nimper-Redirect-Count: " & $head.redirectCount & "\r\n")
+
+    if noBodyResponse:
+      if upstreamContentLen.len > 0 and not isDecodedOnTheFly:
+        headerBuf.add("Content-Length: " & upstreamContentLen & "\r\n")
+    elif useChunkedFraming:
+      headerBuf.add("Transfer-Encoding: chunked\r\n")
+    else:
+      headerBuf.add("Content-Length: " & upstreamContentLen & "\r\n")
+
+    headerBuf.add("Connection: " & (if keepAlive: "keep-alive" else: "close") & "\r\n")
+    headerBuf.add("\r\n")
+
+    if not sendString(sock, headerBuf):
+      return false
+    headersSentToClient = true
+    return true
+
+  let onChunkCb = proc(data: pointer, len: int): bool {.gcsafe.} =
+    if noBodyResponse or len <= 0:
+      return true
+    if useChunkedFraming:
+      let prefix = toHexLower(len) & "\r\n"
+      if not sendString(sock, prefix):
+        return false
+      if not sendAll(sock, data, len):
+        return false
+      if not sendString(sock, "\r\n"):
+        return false
+      return true
+    else:
+      return sendAll(sock, data, len)
+
+  let onProgressCb = proc(dlTotal, dlNow, ulTotal, ulNow: int64): bool {.gcsafe.} =
+    return not isClientDisconnected(sock)
 
   var resp: Response
   try:
-    resp = perform(nimperReq)
+    if session != nil:
+      resp = session.requestStreaming(nimperReq, onHeadersCb, onChunkCb, onProgressCb)
+    else:
+      resp = performStreaming(nimperReq, onHeadersCb, onChunkCb, onProgressCb)
   except CurlImpersonateError as e:
-    logError("nimper error for " & targetUrl & ": " & e.msg)
-    sendErrorResponse(sock, 502, "Bad Gateway (nimper): " & e.msg)
-    return
+    if not headersSentToClient:
+      logError("nimper error for " & targetUrl & ": " & e.msg)
+      sendErrorResponse(sock, 502, "Bad Gateway (nimper): " & e.msg)
+    return false
   except CatchableError as e:
-    logError("unexpected error for " & targetUrl & ": " & e.msg)
-    sendErrorResponse(sock, 500, "Internal Proxy Error: " & e.msg)
-    return
+    if not headersSentToClient:
+      logError("unexpected error for " & targetUrl & ": " & e.msg)
+      sendErrorResponse(sock, 500, "Internal Proxy Error: " & e.msg)
+    return false
 
-  let statusCode = if resp.statusCode > 0: resp.statusCode else: 200
-  let reason = httpStatusReason(statusCode)
+  if resp.abortedByCallback:
+    logInfo(baseCfg.verbose, "Client disconnected mid-stream; aborted upstream download for " & targetUrl)
+    return false
 
-  var outBuf = newStringOfCap(512 + resp.body.len)
-  outBuf.add("HTTP/1.1 " & $statusCode & " " & reason & "\r\n")
+  if useChunkedFraming and headersSentToClient and not noBodyResponse:
+    if not sendString(sock, "0\r\n\r\n"):
+      return false
 
-  if resp.headers != nil:
-    for k, v in resp.headers.pairs:
-      let kl = k.toLowerAscii()
-      # Skip framing & hop-by-hop headers because libcurl-impersonate already decompressed and unchunked the body
-      if kl in ["transfer-encoding", "content-encoding", "content-length", "connection", "proxy-connection", "keep-alive"]:
-        continue
-      outBuf.add(k & ": " & v & "\r\n")
-
-  outBuf.add("X-Nimper-Target: " & resolved.target & "\r\n")
-  if resp.url.len > 0:
-    outBuf.add("X-Nimper-Effective-Url: " & resp.url & "\r\n")
-  outBuf.add("X-Nimper-Upstream-Protocol: " & upstreamHttpVersionString(resp.httpVersion) & "\r\n")
-  if resp.redirectCount > 0:
-    outBuf.add("X-Nimper-Redirect-Count: " & $resp.redirectCount & "\r\n")
-
-  outBuf.add("Content-Length: " & $resp.body.len & "\r\n")
-  outBuf.add("Connection: " & (if keepAlive: "keep-alive" else: "close") & "\r\n")
-  outBuf.add("\r\n")
-
-  if httpReq.httpMethod != "HEAD" and resp.body.len > 0:
-    outBuf.add(resp.body)
-
-  sock.send(outBuf)
+  return keepAlive
 
 proc parseConnectAuthority*(rawTarget: string): (string, int) =
   ## Parses `host:port` (including IPv6 `[::1]:443`) from a `CONNECT` request target.
@@ -313,7 +520,13 @@ proc parseConnectAuthority*(rawTarget: string): (string, int) =
     return (host, port)
   return (clean, 443)
 
-proc handleConnectMitm(client: net.Socket, connectReq: ParsedHttpRequest, cfg: ProxyConfig) =
+proc handleConnectMitm(
+  client: net.Socket,
+  connectReq: ParsedHttpRequest,
+  cfg: ProxyConfig,
+  session: ImpersonateSession,
+  shareHandle: PSH
+) =
   let (host, port) = parseConnectAuthority(connectReq.rawTarget)
   if host.len == 0:
     sendErrorResponse(client, 400, "Invalid CONNECT authority")
@@ -331,7 +544,8 @@ proc handleConnectMitm(client: net.Socket, connectReq: ParsedHttpRequest, cfg: P
     return
 
   # Acknowledge the CONNECT tunnel
-  client.send("HTTP/1.1 200 Connection Established\r\nProxy-Agent: nimper-proxy\r\n\r\n")
+  if not sendString(client, "HTTP/1.1 200 Connection Established\r\nProxy-Agent: nimper-proxy\r\n\r\n"):
+    return
 
   var sslCtx: SslContext = nil
   try:
@@ -358,35 +572,43 @@ proc handleConnectMitm(client: net.Socket, connectReq: ParsedHttpRequest, cfg: P
     if targetUrl.len == 0:
       sendErrorResponse(client, 400, "Missing Host header in tunneled request")
       break
+    var canKeepAlive = false
     try:
-      forwardViaNimper(
+      canKeepAlive = forwardViaNimper(
         client,
         innerReq,
         targetUrl,
         cfg,
         connectOverrides = connectOverrides,
-        keepAlive = innerReq.keepAlive
+        keepAlive = innerReq.keepAlive,
+        session = session,
+        shareHandle = shareHandle
       )
     except CatchableError:
       break
-    if not innerReq.keepAlive:
+    if not canKeepAlive or not innerReq.keepAlive:
       break
 
-proc handleClientSocket(client: net.Socket, cfg: ProxyConfig) =
+proc handleClientSocket(
+  client: net.Socket,
+  cfg: ProxyConfig,
+  session: ImpersonateSession,
+  shareHandle: PSH
+) =
   while true:
     var req: ParsedHttpRequest
     if not readHttpRequest(client, req):
       break
 
     if req.httpMethod == "CONNECT":
-      handleConnectMitm(client, req, cfg)
+      handleConnectMitm(client, req, cfg, session, shareHandle)
       break
 
     # Built-in proxy health/status endpoint when accessed directly
     if req.rawTarget == "/__nimper_proxy/status":
       let body = """{"status":"ok","defaultTarget":"""" & cfg.target & """","impersonateBuild":""" & $isImpersonateBuild() & "}\n"
       let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " & $body.len & "\r\nConnection: close\r\n\r\n" & body
-      client.send(resp)
+      discard sendString(client, resp)
       break
 
     let targetUrl = buildTargetUrl(req, "http")
@@ -394,62 +616,136 @@ proc handleClientSocket(client: net.Socket, cfg: ProxyConfig) =
       sendErrorResponse(client, 400, "Missing target URL or Host header")
       break
 
+    var canKeepAlive = false
     try:
-      forwardViaNimper(
+      canKeepAlive = forwardViaNimper(
         client,
         req,
         targetUrl,
         cfg,
-        keepAlive = req.keepAlive
+        keepAlive = req.keepAlive,
+        session = session,
+        shareHandle = shareHandle
       )
     except CatchableError:
       break
 
-    if not req.keepAlive:
+    if not canKeepAlive or not req.keepAlive:
       break
 
-proc clientWorkerProc(args: ClientWorkerArgs) {.thread.} =
+proc enqueueSocket(q: ptr SocketQueue, fd: SocketHandle) =
+  acquire(q.lock)
+  while q.count >= MaxSocketQueueCapacity:
+    wait(q.notFull, q.lock)
+  q.buf[q.tail] = fd
+  q.tail = (q.tail + 1) mod MaxSocketQueueCapacity
+  inc(q.count)
+  signal(q.notEmpty)
+  release(q.lock)
+
+proc dequeueSocket(q: ptr SocketQueue): SocketHandle =
+  acquire(q.lock)
+  while q.count == 0:
+    wait(q.notEmpty, q.lock)
+  result = q.buf[q.head]
+  q.head = (q.head + 1) mod MaxSocketQueueCapacity
+  dec(q.count)
+  signal(q.notFull)
+  release(q.lock)
+
+proc workerPoolProc(args: WorkerThreadArgs) {.thread.} =
   {.cast(gcsafe).}:
-    let client = newSocket(args.clientFd)
-    try:
-      handleClientSocket(client, args.cfg)
-    except CatchableError as e:
-      if args.cfg.verbose:
-        logError("Worker exception: " & e.msg)
-    finally:
+    let workerSession = newImpersonateSession(
+      target = args.cfg.target,
+      defaultHeaders = args.cfg.defaultHeaders,
+      timeoutMs = args.cfg.timeoutMs,
+      connectTimeoutMs = args.cfg.connectTimeoutMs,
+      bufferSize = StreamBufferSize,
+      followRedirects = args.cfg.followRedirects,
+      safeRedirects = args.cfg.safeRedirects,
+      maxRedirects = args.cfg.maxRedirects,
+      verifySsl = args.cfg.verifySsl,
+      proxy = args.cfg.upstreamProxy,
+      share = args.shareHandle
+    )
+    defer:
+      workerSession.close()
+
+    while true:
+      let fd = dequeueSocket(args.queue)
+      if fd == osInvalidSocket:
+        break
+      let client = newSocket(fd, buffered = true)
       try:
-        client.close()
-      except CatchableError:
-        discard
+        try:
+          client.setSockOpt(OptNoDelay, true)
+        except CatchableError:
+          discard
+        handleClientSocket(client, args.cfg, workerSession, args.shareHandle)
+      except CatchableError as e:
+        if args.cfg.verbose:
+          logError("Worker exception: " & e.msg)
+      finally:
+        try:
+          client.close()
+        except CatchableError:
+          discard
 
 proc runProxyServer*(cfg: ProxyConfig) =
-  ## Initializes `nimper` and the MITM Root CA, binds to `cfg.bindAddr:cfg.port`,
-  ## and dispatches incoming proxy connections to worker threads.
+  ## Initializes `nimper`, the MITM Root CA, a cross-worker `CURLSH*` cache, and a bounded
+  ## pre-allocated worker thread pool, then dispatches incoming proxy connections via a queue.
   ensureGlobalInit()
   discard ensureRootCa(cfg.caDir)
+
+  let globalShare = newImpersonateShare(
+    shareDns = true,
+    shareSslSession = true,
+    shareConnect = true,
+    shareCookies = false
+  )
+  defer:
+    globalShare.close()
+
+  var queuePtr = cast[ptr SocketQueue](allocShared0(sizeof(SocketQueue)))
+  initLock(queuePtr.lock)
+  initCond(queuePtr.notEmpty)
+  initCond(queuePtr.notFull)
+
+  let numWorkers = max(2, cfg.workerThreads)
+  var workers = newSeq[Thread[WorkerThreadArgs]](numWorkers)
+  for i in 0 ..< numWorkers:
+    createThread(
+      workers[i],
+      workerPoolProc,
+      WorkerThreadArgs(
+        workerId: i,
+        cfg: cfg,
+        queue: queuePtr,
+        shareHandle: globalShare.handle
+      )
+    )
 
   var server = newSocket()
   server.setSockOpt(OptReuseAddr, true)
   server.bindAddr(Port(cfg.port), cfg.bindAddr)
   server.listen()
+  let serverFd = server.getFd()
+
+  logInfo(
+    cfg.verbose,
+    "Listening on " & cfg.bindAddr & ":" & $cfg.port &
+    " with " & $numWorkers & " pooled worker threads"
+  )
 
   while true:
-    var client: net.Socket = nil
+    var clientFd = osInvalidSocket
     try:
-      server.accept(client)
+      let (fd, _) = nativesockets.accept(serverFd)
+      clientFd = fd
     except CatchableError:
       continue
 
-    if client == nil:
+    if clientFd == osInvalidSocket:
       continue
 
-    let fd = client.getFd()
-    # Detach ownership from `client` ref in main thread so GC doesn't close `fd` while worker thread uses it
-    GC_ref(client)
-    var workerPtr = cast[ptr Thread[ClientWorkerArgs]](allocShared0(sizeof(Thread[ClientWorkerArgs])))
-    try:
-      createThread(workerPtr[], clientWorkerProc, ClientWorkerArgs(clientFd: fd, cfg: cfg))
-    except CatchableError as e:
-      logError("Failed to spawn worker thread: " & e.msg)
-      deallocShared(workerPtr)
-      try: client.close() except CatchableError: discard
+    enqueueSocket(queuePtr, clientFd)

@@ -2,13 +2,14 @@
 #          nimper-proxy — Configuration & Per-Request Header Overrides
 #
 
-import std/[os, parseopt, strutils]
+import std/[os, strutils]
 import nimper
 
 type
   ProxyConfig* = object
     bindAddr*: string
     port*: int
+    workerThreads*: int
     target*: string
     defaultHeaders*: bool
     followRedirects*: bool
@@ -89,6 +90,10 @@ proc initDefaultProxyConfig*(): ProxyConfig =
     result.port = parseInt(getEnv("NIMPER_PORT", "8080"))
   except ValueError:
     result.port = 8080
+  try:
+    result.workerThreads = max(2, parseInt(getEnv("NIMPER_WORKERS", "32")))
+  except ValueError:
+    result.workerThreads = 32
   result.target = getEnv("NIMPER_TARGET", $itFirefox155)
   result.defaultHeaders = parseBoolFlag(getEnv("NIMPER_DEFAULT_HEADERS", "true"), true)
   result.followRedirects = parseBoolFlag(getEnv("NIMPER_FOLLOW_REDIRECTS", "false"), false)
@@ -109,52 +114,102 @@ proc initDefaultProxyConfig*(): ProxyConfig =
 
 proc parseCliConfig*(args: seq[string] = commandLineParams()): ProxyConfig =
   result = initDefaultProxyConfig()
-  var p = initOptParser(args)
-  while true:
-    p.next()
-    case p.kind
-    of cmdEnd:
-      break
-    of cmdShortOption, cmdLongOption:
-      let key = p.key.toLowerAscii().replace("_", "-")
-      case key
-      of "b", "bind", "host":
-        result.bindAddr = p.val
-      of "p", "port":
-        result.port = parseInt(p.val)
-      of "t", "target", "impersonate":
-        result.target = p.val
-      of "default-headers":
-        result.defaultHeaders = if p.val.len == 0: true else: parseBoolFlag(p.val, true)
-      of "no-default-headers":
-        result.defaultHeaders = false
-      of "follow-redirects", "location", "l":
-        result.followRedirects = if p.val.len == 0: true else: parseBoolFlag(p.val, true)
-      of "safe-redirects":
-        result.safeRedirects = if p.val.len == 0: true else: parseBoolFlag(p.val, true)
-      of "max-redirects":
-        result.maxRedirects = parseInt(p.val)
-      of "verify-ssl":
-        result.verifySsl = if p.val.len == 0: true else: parseBoolFlag(p.val, true)
-      of "k", "insecure", "no-verify-ssl":
-        result.verifySsl = false
-      of "x", "upstream-proxy", "proxy":
-        result.upstreamProxy = p.val
-      of "timeout", "timeout-ms":
-        result.timeoutMs = parseInt(p.val)
-      of "connect-timeout", "connect-timeout-ms":
-        result.connectTimeoutMs = parseInt(p.val)
-      of "ca-dir":
-        result.caDir = p.val
-      of "v", "verbose":
-        result.verbose = if p.val.len == 0: true else: parseBoolFlag(p.val, true)
-      of "list-targets":
-        result.listTargets = true
-      of "h", "help":
-        result.showHelp = true
+  var i = 0
+  while i < args.len:
+    let arg = args[i]
+    inc i
+    if not arg.startsWith("-") or arg == "-" or arg == "--":
+      continue
+    let stripped = if arg.startsWith("--"): arg[2 .. ^1] else: arg[1 .. ^1]
+    var rawKey = stripped
+    var inlineVal = ""
+    var hasInlineVal = false
+    for sepIdx in 0 ..< stripped.len:
+      if stripped[sepIdx] in {'=', ':'}:
+        rawKey = stripped[0 ..< sepIdx]
+        inlineVal = stripped[sepIdx + 1 .. ^1]
+        hasInlineVal = true
+        break
+    let key = rawKey.toLowerAscii().replace("_", "-")
+    template consumeVal(): string =
+      if hasInlineVal:
+        inlineVal
+      elif i < args.len:
+        let v = args[i]
+        inc i
+        v
       else:
-        discard
-    of cmdArgument:
+        ""
+
+    case key
+    of "b", "bind", "host":
+      result.bindAddr = consumeVal()
+    of "p", "port":
+      let v = consumeVal()
+      if v.len > 0:
+        result.port = parseInt(v)
+    of "w", "workers", "threads":
+      let v = consumeVal()
+      if v.len > 0:
+        result.workerThreads = max(2, parseInt(v))
+    of "t", "target", "impersonate":
+      result.target = consumeVal()
+    of "default-headers":
+      if hasInlineVal:
+        result.defaultHeaders = parseBoolFlag(inlineVal, true)
+      elif i < args.len and not args[i].startsWith("-"):
+        result.defaultHeaders = parseBoolFlag(args[i], true)
+        inc i
+      else:
+        result.defaultHeaders = true
+    of "no-default-headers":
+      result.defaultHeaders = false
+    of "follow-redirects", "location", "l":
+      if hasInlineVal:
+        result.followRedirects = parseBoolFlag(inlineVal, true)
+      else:
+        result.followRedirects = true
+    of "safe-redirects":
+      if hasInlineVal:
+        result.safeRedirects = parseBoolFlag(inlineVal, true)
+      else:
+        result.safeRedirects = true
+    of "max-redirects":
+      let v = consumeVal()
+      if v.len > 0:
+        result.maxRedirects = parseInt(v)
+    of "verify-ssl":
+      if hasInlineVal:
+        result.verifySsl = parseBoolFlag(inlineVal, true)
+      elif i < args.len and not args[i].startsWith("-"):
+        result.verifySsl = parseBoolFlag(args[i], true)
+        inc i
+      else:
+        result.verifySsl = true
+    of "k", "insecure", "no-verify-ssl":
+      result.verifySsl = false
+    of "x", "upstream-proxy", "proxy":
+      result.upstreamProxy = consumeVal()
+    of "timeout", "timeout-ms":
+      let v = consumeVal()
+      if v.len > 0:
+        result.timeoutMs = parseInt(v)
+    of "connect-timeout", "connect-timeout-ms":
+      let v = consumeVal()
+      if v.len > 0:
+        result.connectTimeoutMs = parseInt(v)
+    of "ca-dir":
+      result.caDir = consumeVal()
+    of "v", "verbose":
+      if hasInlineVal:
+        result.verbose = parseBoolFlag(inlineVal, true)
+      else:
+        result.verbose = true
+    of "list-targets":
+      result.listTargets = true
+    of "h", "help":
+      result.showHelp = true
+    else:
       discard
 
 proc isHopByHopOrControlHeader*(keyLower: string): bool =
@@ -233,6 +288,13 @@ proc resolveRequestConfig*(base: ProxyConfig, ov: RequestOverrides): ResolvedReq
   result.httpVersion = if ov.hasHttpVersion: ov.httpVersion else: HTTP_VERSION_NONE
   result.preserveUserAgent = ov.preserveUserAgent
 
+proc hasRangeHeader*(rawHeaders: openArray[(string, string)]): bool =
+  ## Returns true if the request headers include an HTTP `Range` header.
+  for (k, v) in rawHeaders:
+    if cmpIgnoreCase(k.strip(), "range") == 0 and v.strip().len > 0:
+      return true
+  return false
+
 proc filterUpstreamHeaders*(
   rawHeaders: openArray[(string, string)],
   resolved: ResolvedRequestConfig
@@ -240,10 +302,13 @@ proc filterUpstreamHeaders*(
   ## Filters client headers before passing them to `nimper`:
   ## - Strips hop-by-hop and `X-Impersonate*`/`X-Nimper-*` control headers
   ## - Strips `Host` (since `libcurl` generates `Host` / `:authority` from the URL)
-  ## - Strips `Accept-Encoding` (since `nimper` advertises and auto-decompresses `gzip, deflate, br, zstd`)
+  ## - Strips `Accept-Encoding` for normal requests (since `nimper` advertises and auto-decompresses `gzip, deflate, br, zstd`),
+  ##   or forces `Accept-Encoding: identity` when a `Range` header is present to prevent userspace decompression
+  ##   and preserve exact byte-offset alignment for streaming media clients (e.g. MPV / FFmpeg).
   ## - Strips `User-Agent` when `defaultHeaders = true` and `preserveUserAgent = false` so that
   ##   `libcurl-impersonate`'s authentic browser `User-Agent` is sent instead of `curl/8.x`
   result = @[]
+  let isRange = hasRangeHeader(rawHeaders)
   for (k, v) in rawHeaders:
     let kl = k.strip().toLowerAscii()
     if isHopByHopOrControlHeader(kl):
@@ -253,6 +318,8 @@ proc filterUpstreamHeaders*(
     if kl == "user-agent" and resolved.defaultHeaders and not resolved.preserveUserAgent:
       continue
     result.add((k.strip(), v.strip()))
+  if isRange:
+    result.add(("Accept-Encoding", "identity"))
 
 proc formatHelpText*(): string =
   result = """
@@ -264,6 +331,7 @@ Usage:
 Options:
   -b, --bind <addr>            Bind address (default: 127.0.0.1, env: NIMPER_BIND)
   -p, --port <port>            Listen port (default: 8080, env: NIMPER_PORT)
+  -w, --workers <count>        Worker thread pool size (default: 32, env: NIMPER_WORKERS)
   -t, --target <profile>       Default browser target (default: firefox155, env: NIMPER_TARGET)
       --default-headers <bool> Inject default browser headers (default: true)
       --no-default-headers     Disable default browser headers

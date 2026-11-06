@@ -3,7 +3,7 @@
 #
 
 import nimper
-import nimper_proxy/[config, certs, server]
+import nimper_proxy/[config, server]
 
 proc main* {.gcsafe.} =
   let cfg = parseCliConfig()
