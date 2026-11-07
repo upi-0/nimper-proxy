@@ -6,6 +6,7 @@ description   = "HTTP & HTTPS (MITM CONNECT) forward proxy powered by nimper (li
 license       = "MIT"
 srcDir        = "src"
 bin           = @["nimper_proxy"]
+installExt    = @["nim"]
 
 # Dependencies
 
