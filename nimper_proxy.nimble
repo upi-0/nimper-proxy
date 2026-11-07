@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.2.0"
+version       = "0.2.1"
 author        = "upi-0"
 description   = "HTTP & HTTPS (MITM CONNECT) forward proxy powered by nimper (libcurl-impersonate)"
 license       = "MIT"
